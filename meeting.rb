@@ -4,16 +4,14 @@ require 'sinatra'
 
 class Array
 	def each_two
-		while self.length >= 2
-			a = self.shift
-			b = self.shift
-			yield a, b
+		while length >= 2
+			yield shift, shift
 		end
 	end
 end
 
 class  Meeting_Stats
-	attr_accessor :members, :cur_index, :next_meeting_at, :names, :has_sent_notifier_for_current
+	attr_accessor :members, :cur_index, :next_meeting_at, :names, :has_sent_notifier_for_current, :real_cur
 
 	MEM_FILE = ".weekly_meeting_members"
 	CONF_FILE = ".weekly_config"
@@ -36,10 +34,21 @@ class  Meeting_Stats
 	def next_maybe 
 		n = Time.now
 		n += 60*60*24 #advance one day
-		until n.wday == 1
-			n += 60*60*24
-		end
+		n += 60*60*24 until n.wday == 1 #advance until next Monday
 		[n.year, n.month, n.day].collect(&:to_s).join '/'
+	end
+
+	def next_holder_mail m
+		@lock.lock
+		n = nil
+		for name, mail in @members
+			n = name if mail == m
+		end
+		if n
+			@real_cur = n
+			refresh_conf_file
+		end
+		@lock.unlock
 	end
 
 	def add_member (n, m)
@@ -47,15 +56,34 @@ class  Meeting_Stats
 		@lock.lock
 		@names << n
 		@names.sort!
-		n_nth = name_index n
+		n_nth = @names.index n
 		@members[n] = m		
 		#adjust the index to advance if the new joined name is in the part which have already hold the meeting
-		if n_nth <=@cur_index
+		if n_nth <= @cur_index
 			@cur_index += 1
 			refresh_conf_file
 		end
 
 		refresh_members_file
+		@lock.unlock
+	end
+
+	def del_member m
+		@lock.lock
+		who = nil
+		for name,mail in @members
+			who = name if mail == m
+		end
+		if who
+			nth = @names.index who
+			if nth <= @cur_index
+				@cur_index -= 1
+				refresh_conf_file
+			end
+			@names.delete who
+			refresh_members_file
+		end
+
 		@lock.unlock
 	end
 
@@ -77,7 +105,7 @@ class  Meeting_Stats
 	#this will also update the config file
 	def send_notifier
 		@lock.lock
-		who = @names[@cur_index]
+		who = @real_cur ? @real_cur : @names[@cur_index]
 		mail = @members[who]
 		unless @has_sent_notifier_for_current
 			send_mail :notify, who, mail
@@ -87,6 +115,12 @@ class  Meeting_Stats
 		@lock.unlock
 
 		ask_for_confirm who, mail
+	end
+
+	# only for @real_cur changed 
+	def resend
+		send_mail :notify, @real_cur, @members[@real_cur]
+		refresh_conf_file
 	end
 	
 	def recv_confirm_from 
@@ -98,11 +132,12 @@ class  Meeting_Stats
 			@cur_index %= @names.count
 			@holder_confirmed = true
 			@has_sent_notifier_for_current = false
+			@real_cur = nil
 			refresh_conf_file
 			@cv.signal
 		else
-				#name is what we want
-				#TODO
+			#name is not what we want
+			#TODO
 		end			
 
 		@lock.unlock
@@ -110,7 +145,7 @@ class  Meeting_Stats
 	
 	private 
 	def send_mail (type, who, mail)
-		str = 'mail -s "Weekly meeting host notice" ' + mail 
+		str = 'mail -s "Weekly meeting host notice"  -r xxx@xxx.com' + mail
 		if type == :notify
 			system (str + " < notice")
 		else
@@ -131,8 +166,9 @@ class  Meeting_Stats
 		conf[:index] = @cur_index
 		conf[:next_meeting_at] = @next_meeting_at
 		conf[:has_sent_notifier_for_current] = @has_sent_notifier_for_current
+		conf[:real_cur] = @real_cur
 		File.open(CONF_FILE, "w") do |f|
-			puts conf.to_s
+			#puts conf.to_s
 			f.write conf.to_s
 		end
 	end
@@ -155,26 +191,12 @@ class  Meeting_Stats
 		#only need for the first time
 		refresh_members_file
 	end
-	#get the index of the meeting members of arg name
-	def name_index  name
-		for i in (0 .. @names.length)
-			if @names[i] == name
-				return i
-			end
-		end
-		throw Exception
-	end
 	
 	def  chomp_the_name (n)
 		n.chomp!
-		n = n.split(/ /).collect do |x|
-			x == "" ? nil : x
-		end
+		n = n.split(/[, ]/).collect { |x| x == "" ? nil : x }
 		n = n.compact.collect do |x|
 			x = x.downcase.capitalize
-			if x.end_with? ','
-				x.slice!(x.length - 1)
-			end
 			x
 		end
 		n.join ','
@@ -186,6 +208,8 @@ class  Meeting_Stats
 		@cur_index = conf[:index]
 		@next_meeting_at = conf[:next_meeting_at]
 		@has_sent_notifier_for_current = conf[:has_sent_notifier_for_current]
+		@real_cur = conf[:real_cur]
+		@real_cur = chomp_the_name @real_cur if @real_cur
 	end	
 
 	def ask_for_confirm who, mail
@@ -233,14 +257,14 @@ Thread.new {
 	stat.send_notifier
 }
 
-get "/" do
-	w = stat.cur_member
+get "/finish" do
+	w = stat.real_cur ? stat.real_cur : stat.cur_member
 	s = "<form method='post' action='/confirm'>" + 
-	w + ' has finished holding the weekly meeting<br>'  +
-	"Please help to confirm the time of next meeting: <input type='text' name='when_next'
-	value='" + stat.next_maybe + "'><br>" + 
-	"<input type='submit' name='.submit'>
-	</form>"
+		w + ' has finished holding the weekly meeting<br>'  +
+		"Please help to confirm the time of next meeting: <input type='text' name='when_next'
+		value='" + stat.next_maybe + "'><br>" + 
+		"<input type='submit' name='.submit'>
+		</form>"
 	erb s
 end
 
@@ -249,4 +273,38 @@ post "/confirm" do
 	stat.recv_confirm_from 
 	stat.next_at params[:when_next]
 	"Thanks for your effort to hold the weekly meeting"
+end
+
+get "/change" do
+	w = stat.real_cur ? stat.real_cur : stat.cur_member
+	m = stat.members[w]
+	at = stat.next_meeting_at
+	s = '<form method="post" action="/change_confirm">' +  
+		'who will hold for next meeting(using mail address): <input type="text" name="who" value="' + m + '"/> <br>' +
+		'when will be the next meeting at(format like 2012/09/03): <input type="text" name="when" value="' + at + '"/> <br>' +
+		'new member: <input type="text" name="mem_name" value="name" /> <input type="text" name="mem_mail" value="mail address" /> <br>' +
+		'del member: <input type="text" name="del_mem" value="mail_addr"/> <br>' + 
+		'<input type="submit" name=".submit"> </form>'
+	erb s
+end
+
+post "/change_confirm" do
+	#puts params
+	who = params[:who]
+	at = params[:when]
+	#cur_who = stat.cur_member
+	#cur_at = stat.next_meeting_at
+	stat.next_holder_mail who
+	stat.next_meeting_at = at
+
+	stat.resend
+
+	mem_name = params[:mem_name]
+	mem_mail = params[:mem_mail]
+	stat.add_member mem_name, mem_mail if mem_name != "name"
+
+	del_mem = params[:del_mem]
+	stat.del_member del_mem if del_mem != "mail_addr"
+
+	"Modification success"
 end
